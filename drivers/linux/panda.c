@@ -138,7 +138,7 @@ static inline struct panda_usb_ctx *panda_usb_get_free_ctx(struct panda_inf_priv
     }
   }
 
-  printk("CTX num %d\n", atomic_read(&priv->free_ctx_cnt));
+  // printk("CTX num %d\n", atomic_read(&priv->free_ctx_cnt));
   if (!atomic_read(&priv->free_ctx_cnt)){
     /* That was the last free ctx. Slow down tx path */
     printk("SENDING TOO FAST\n");
@@ -509,7 +509,7 @@ static netdev_tx_t panda_usb_start_xmit(struct sk_buff *skb,
   if(!(cf->can_id & CAN_RTR_FLAG))
     memcpy(usb_msg.data, cf->data, cf->len);
 
-  netdev_dbg(netdev, "Received data from socket. canid: %x; len: %d\n", cf->can_id, cf->len);
+  // netdev_dbg(netdev, "Received data from socket. canid: %x; len: %d\n", cf->can_id, cf->len);
 
   err = panda_usb_xmit(priv_inf, &usb_msg, ctx);
   if (err)
