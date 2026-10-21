@@ -32,6 +32,7 @@
 #define PANDA_NUM_CAN_INTERFACES 3
 
 #define PANDA_CAN_TRANSMIT 1
+#define PANDA_CAN_REMOTE 2
 #define PANDA_CAN_EXTENDED 4
 
 #define PANDA_BITRATE 500000
@@ -287,8 +288,9 @@ static void panda_usb_process_can_rx(struct panda_dev_priv *priv_dev,
   int bus_num;
   struct panda_inf_priv *priv_inf;
   struct net_device_stats *stats;
+  u32 rir;
 
-  bus_num = (msg->bus_dat_len >> 4) & 0xf;
+  bus_num = (le32_to_cpu(msg->bus_dat_len) >> 4) & 0xf;
   priv_inf = panda_get_inf_from_bus_id(priv_dev, bus_num);
   if(!priv_inf){
     printk("Got something on an unused interface %d\n", bus_num);
@@ -306,19 +308,20 @@ static void panda_usb_process_can_rx(struct panda_dev_priv *priv_dev,
   if (!skb)
     return;
 
-  if(msg->rir & PANDA_CAN_EXTENDED){
-    cf->can_id = (msg->rir >> 3) | CAN_EFF_FLAG;
+  rir = le32_to_cpu(msg->rir);
+  if(rir & PANDA_CAN_EXTENDED){
+    cf->can_id = (rir >> 3) | CAN_EFF_FLAG;
   }else{
-    cf->can_id = (msg->rir >> 21);
+    cf->can_id = (rir >> 21);
   }
 
-  // TODO: Handle Remote Frames
-  //if (msg->dlc & MCBA_DLC_RTR_MASK)
-  //  cf->can_id |= CAN_RTR_FLAG;
+  if(rir & PANDA_CAN_REMOTE)
+    cf->can_id |= CAN_RTR_FLAG;
 
-  cf->len = can_cc_dlc2len(msg->bus_dat_len & PANDA_DLC_MASK);
+  cf->len = can_cc_dlc2len(le32_to_cpu(msg->bus_dat_len) & PANDA_DLC_MASK);
 
-  memcpy(cf->data, msg->data, cf->len);
+  if(!(cf->can_id & CAN_RTR_FLAG))
+    memcpy(cf->data, msg->data, cf->len);
 
   stats->rx_packets++;
   stats->rx_bytes += cf->len;
@@ -477,6 +480,7 @@ static netdev_tx_t panda_usb_start_xmit(struct sk_buff *skb,
   int err;
   struct panda_usb_can_msg usb_msg = {};
   int bus = priv_inf->mcu_can_ifnum;
+  u32 rir;
 
   if (can_dropped_invalid_skb(netdev, skb)){
     printk("Invalid CAN packet");
@@ -490,20 +494,22 @@ static netdev_tx_t panda_usb_start_xmit(struct sk_buff *skb,
   can_put_echo_skb(skb, priv_inf->netdev, ctx->ndx, 0);
 
   if(cf->can_id & CAN_EFF_FLAG){
-    usb_msg.rir = cpu_to_le32(((cf->can_id & 0x1FFFFFFF) << 3) |
-			      PANDA_CAN_TRANSMIT | PANDA_CAN_EXTENDED);
+    rir = ((cf->can_id & CAN_EFF_MASK) << 3) |
+      PANDA_CAN_TRANSMIT | PANDA_CAN_EXTENDED;
   }else{
-    usb_msg.rir = cpu_to_le32(((cf->can_id & 0x7FF) << 21) | PANDA_CAN_TRANSMIT);
+    rir = ((cf->can_id & CAN_SFF_MASK) << 21) | PANDA_CAN_TRANSMIT;
   }
+
+  if(cf->can_id & CAN_RTR_FLAG)
+    rir |= PANDA_CAN_REMOTE;
+
+  usb_msg.rir = cpu_to_le32(rir);
   usb_msg.bus_dat_len = cpu_to_le32((cf->len & 0x0F) | (bus << 4));
 
-  memcpy(usb_msg.data, cf->data, cf->len);
+  if(!(cf->can_id & CAN_RTR_FLAG))
+    memcpy(usb_msg.data, cf->data, cf->len);
 
-  //TODO Handle Remote Frames
-  //if (cf->can_id & CAN_RTR_FLAG)
-  //  usb_msg.dlc |= PANDA_DLC_RTR_MASK;
-
-  netdev_err(netdev, "Received data from socket. canid: %x; len: %d\n", cf->can_id, cf->len);
+  netdev_dbg(netdev, "Received data from socket. canid: %x; len: %d\n", cf->can_id, cf->len);
 
   err = panda_usb_xmit(priv_inf, &usb_msg, ctx);
   if (err)
