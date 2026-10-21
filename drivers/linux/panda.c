@@ -36,6 +36,23 @@
 
 #define PANDA_BITRATE 500000
 
+/* Firmware request 0xDE stores kbps*10 (500 kbit/s -> 5000). The bxCAN
+ * prescaler is 3000000/bitrate, so only these rates land on an integer
+ * prescaler. SocketCAN rejects any bitrate not in this list.
+ */
+static const u32 panda_bitrate_const[] = {
+  1000000,
+  500000,
+  250000,
+  200000,
+  125000,
+  100000,
+  50000,
+  40000,
+  20000,
+  10000,
+};
+
 #define PANDA_DLC_MASK  0x0F
 
 #define SAFETY_ALLOUTPUT 17
@@ -44,7 +61,6 @@
 struct panda_usb_ctx {
   struct panda_inf_priv *priv;
   u32 ndx;
-  u8 dlc;
 };
 
 struct panda_dev_priv;
@@ -106,8 +122,7 @@ static inline void panda_init_ctx(struct panda_inf_priv *priv)
   atomic_set(&priv->free_ctx_cnt, ARRAY_SIZE(priv->tx_context));
 }
 
-static inline struct panda_usb_ctx *panda_usb_get_free_ctx(struct panda_inf_priv *priv,
-							 struct can_frame *cf)
+static inline struct panda_usb_ctx *panda_usb_get_free_ctx(struct panda_inf_priv *priv)
 {
   int i = 0;
   struct panda_usb_ctx *ctx = NULL;
@@ -116,7 +131,6 @@ static inline struct panda_usb_ctx *panda_usb_get_free_ctx(struct panda_inf_priv
     if (priv->tx_context[i].ndx == PANDA_CTX_FREE) {
       ctx = &priv->tx_context[i];
       ctx->ndx = i;
-      ctx->dlc = cf->can_dlc;
 
       atomic_dec(&priv->free_ctx_cnt);
       break;
@@ -162,6 +176,27 @@ static int panda_set_output_enable(struct panda_inf_priv* priv, bool enable){
 			 enable ? SAFETY_ALLOUTPUT : SAFETY_SILENT, 0, NULL, 0, USB_CTRL_SET_TIMEOUT);
 }
 
+/* Program the panda bitrate. wValue is the bus (0..2); wIndex is kbps*10. */
+static int panda_set_bittiming(struct net_device *netdev)
+{
+  struct panda_inf_priv *priv = netdev_priv(netdev);
+  u32 bitrate = priv->can.bittiming.bitrate;
+  int err;
+
+  err = usb_control_msg(priv->priv_dev->udev,
+			usb_sndctrlpipe(priv->priv_dev->udev, 0),
+			0xDE, USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+			priv->interface_num, bitrate / 100,
+			NULL, 0, USB_CTRL_SET_TIMEOUT);
+  if (err < 0) {
+    netdev_err(netdev, "failed to set bitrate %u on bus %u: %d\n",
+	       bitrate, priv->interface_num, err);
+    return err;
+  }
+
+  return 0;
+}
+
 static void panda_usb_write_bulk_callback(struct urb *urb)
 {
   struct panda_usb_ctx *ctx = urb->context;
@@ -179,9 +214,7 @@ static void panda_usb_write_bulk_callback(struct urb *urb)
     return;
 
   netdev->stats.tx_packets++;
-  netdev->stats.tx_bytes += ctx->dlc;
-
-  can_get_echo_skb(netdev, ctx->ndx);
+  netdev->stats.tx_bytes += can_get_echo_skb(netdev, ctx->ndx, NULL);
 
   if (urb->status)
     netdev_info(netdev, "Tx URB aborted (%d)\n", urb->status);
@@ -283,12 +316,12 @@ static void panda_usb_process_can_rx(struct panda_dev_priv *priv_dev,
   //if (msg->dlc & MCBA_DLC_RTR_MASK)
   //  cf->can_id |= CAN_RTR_FLAG;
 
-  cf->can_dlc = get_can_dlc(msg->bus_dat_len & PANDA_DLC_MASK);
+  cf->len = can_cc_dlc2len(msg->bus_dat_len & PANDA_DLC_MASK);
 
-  memcpy(cf->data, msg->data, cf->can_dlc);
+  memcpy(cf->data, msg->data, cf->len);
 
   stats->rx_packets++;
-  stats->rx_bytes += cf->can_dlc;
+  stats->rx_bytes += cf->len;
 
   netif_rx(skb);
 }
@@ -450,11 +483,11 @@ static netdev_tx_t panda_usb_start_xmit(struct sk_buff *skb,
     return NETDEV_TX_OK;
   }
 
-  ctx = panda_usb_get_free_ctx(priv_inf, cf);
+  ctx = panda_usb_get_free_ctx(priv_inf);
 
   //Warning: cargo cult. Can't tell what this is for, but it is
   //everywhere and encouraged in the documentation.
-  can_put_echo_skb(skb, priv_inf->netdev, ctx->ndx);
+  can_put_echo_skb(skb, priv_inf->netdev, ctx->ndx, 0);
 
   if(cf->can_id & CAN_EFF_FLAG){
     usb_msg.rir = cpu_to_le32(((cf->can_id & 0x1FFFFFFF) << 3) |
@@ -462,15 +495,15 @@ static netdev_tx_t panda_usb_start_xmit(struct sk_buff *skb,
   }else{
     usb_msg.rir = cpu_to_le32(((cf->can_id & 0x7FF) << 21) | PANDA_CAN_TRANSMIT);
   }
-  usb_msg.bus_dat_len = cpu_to_le32((cf->can_dlc & 0x0F) | (bus << 4));
+  usb_msg.bus_dat_len = cpu_to_le32((cf->len & 0x0F) | (bus << 4));
 
-  memcpy(usb_msg.data, cf->data, cf->can_dlc);
+  memcpy(usb_msg.data, cf->data, cf->len);
 
   //TODO Handle Remote Frames
   //if (cf->can_id & CAN_RTR_FLAG)
   //  usb_msg.dlc |= PANDA_DLC_RTR_MASK;
 
-  netdev_err(netdev, "Received data from socket. canid: %x; len: %d\n", cf->can_id, cf->can_dlc);
+  netdev_err(netdev, "Received data from socket. canid: %x; len: %d\n", cf->can_id, cf->len);
 
   err = panda_usb_xmit(priv_inf, &usb_msg, ctx);
   if (err)
@@ -479,7 +512,7 @@ static netdev_tx_t panda_usb_start_xmit(struct sk_buff *skb,
   return NETDEV_TX_OK;
 
  xmit_failed:
-  can_free_echo_skb(priv_inf->netdev, ctx->ndx);
+  can_free_echo_skb(priv_inf->netdev, ctx->ndx, NULL);
   panda_usb_free_ctx(ctx);
   dev_kfree_skb(skb);
   stats->tx_dropped++;
@@ -534,6 +567,9 @@ static int panda_usb_probe(struct usb_interface *intf,
     /* Init CAN device */
     priv_inf->can.state = CAN_STATE_STOPPED;
     priv_inf->can.bittiming.bitrate = PANDA_BITRATE;
+    priv_inf->can.bitrate_const = panda_bitrate_const;
+    priv_inf->can.bitrate_const_cnt = ARRAY_SIZE(panda_bitrate_const);
+    priv_inf->can.do_set_bittiming = panda_set_bittiming;
 
     SET_NETDEV_DEV(netdev, &intf->dev);
 

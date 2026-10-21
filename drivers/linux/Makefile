@@ -5,10 +5,10 @@ link:
 	sudo dkms add `pwd`
 
 build:
-	sudo dkms build panda/$(VERSION)
+	sudo dkms build panda/$(VERSION) --force
 
 install:
-	sudo dkms install panda/$(VERSION)
+	sudo dkms install panda/$(VERSION) --force
 
 all:	build install
 
